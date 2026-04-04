@@ -306,6 +306,7 @@ static void pinnacle_send_abs(const struct device *dev) {
     if (!config->no_taps && (btn || data->btn_cache)) {
         for (int i = 0; i < 3; i++) {
             uint8_t btn_val = btn & BIT(i);
+            LOG_INF("btn: i=%d btn_val=%d btn_cache=%d", i,btn_val,data->btn_cache & BIT(i));
             if (btn_val != (data->btn_cache & BIT(i))) {
                 input_report_key(dev, INPUT_BTN_0 + i, btn_val ? 1 : 0, false, K_FOREVER);
             }
@@ -330,8 +331,11 @@ static void pinnacle_send_abs(const struct device *dev) {
         x = ((x - config->absolute_mode_clamp_min_x) * config->absolute_mode_scale_to_width) / (config->absolute_mode_clamp_max_x - config->absolute_mode_clamp_min_x);
         y = ((y - config->absolute_mode_clamp_min_y) * config->absolute_mode_scale_to_height) / (config->absolute_mode_clamp_max_y - config->absolute_mode_clamp_min_y);
 
+        LOG_INF("abs report: x=%d y=%d", x, y);
         input_report_abs(dev, INPUT_ABS_X, x, false, K_FOREVER);
         input_report_abs(dev, INPUT_ABS_Y, y, true, K_FOREVER);
+    } else {
+        LOG_INF("abs: z=0, no events emitted");
     }
 
     return;
@@ -364,7 +368,7 @@ static int pinnacle_read_abs(const struct device *dev) {
     data->last_y = ((xy_high & 0xF0) << 4) | y_low;
     data->last_z = (uint8_t)(packet[5] & 0x1F);
 
-    LOG_DBG("button: %d, x: %d y: %d z: %d", data->last_btn, data->last_x, data->last_y, data->last_z);
+    LOG_INF("abs pkt: btn=%d x=%d y=%d z=%d", data->last_btn, data->last_x, data->last_y, data->last_z);
     return 0;
 }
 
@@ -709,9 +713,9 @@ static int pinnacle_init(const struct device *dev) {
     uint8_t feed_cfg1 = PINNACLE_FEED_CFG1_EN_FEED;
     if (config->absolute_mode || config->abs_rel_divisor) {
         feed_cfg1 |= PINNACLE_FEED_CFG1_ABS_MODE;
-        LOG_ERR("Using absolute mode");
+        LOG_INF("Using absolute mode");
     } else {
-        LOG_ERR("Using relative mode");
+        LOG_INF("Using relative mode");
     }
     if (config->x_invert) {
         feed_cfg1 |= PINNACLE_FEED_CFG1_INV_X;
