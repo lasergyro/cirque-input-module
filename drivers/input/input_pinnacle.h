@@ -3,6 +3,7 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/spi.h>
+#include <zephyr/kernel.h>
 
 #define PINNACLE_READ 0xA0
 #define PINNACLE_WRITE 0x80
@@ -73,6 +74,41 @@
 #define PINNACLE_PACKET0_X_SIGN BIT(4)   // X delta sign
 #define PINNACLE_PACKET0_Y_SIGN BIT(5)   // Y delta sign
 
+/* Mutable runtime gesture params — loaded from DTS defaults, overridable at
+ * runtime via the debug RPC get/set commands (persisted to settings). */
+struct pinnacle_gesture_params {
+    uint16_t tap_timeout_ms;
+    uint16_t drag_window_timeout_ms;
+    uint16_t drag_jump_timeout_ms;
+    uint16_t pad_off_timeout_ms;
+    uint8_t  scroll_rim_percent;
+    uint8_t  drag_jump_rim_percent;
+    uint8_t  dead_radius_percent;
+    uint8_t  rclick_x_min_percent;
+    uint8_t  force_drag_z_threshold;
+    uint8_t  double_click_drag_z_threshold;
+    uint8_t  wheel_clicks;
+    uint8_t  scroll_exclusion_zone_percent;
+    bool     tap_snap;
+};
+
+/* Gesture state machine states */
+enum pinnacle_gesture_state {
+    PINNACLE_STATE_INACTIVE,
+    PINNACLE_STATE_TAP_PENDING,
+    PINNACLE_STATE_MOVING,
+    PINNACLE_STATE_DRAG_WINDOW,
+    PINNACLE_STATE_DRAGGING,
+    PINNACLE_STATE_DRAG_JUMP,
+    PINNACLE_STATE_SCROLL_ACTIVE,
+    PINNACLE_STATE_SCROLL_DEAD,
+};
+
+enum pinnacle_scroll_dir {
+    PINNACLE_SCROLL_VERTICAL,
+    PINNACLE_SCROLL_HORIZONTAL,
+};
+
 struct pinnacle_data {
     uint8_t btn_cache; // the prior button reading
     uint8_t last_btn; // the current button reading
@@ -83,6 +119,22 @@ struct pinnacle_data {
     const struct device *dev;
     struct gpio_callback gpio_cb;
     struct k_work work;
+
+    /* Gesture state machine (abs mode only) */
+    enum pinnacle_gesture_state state;
+    bool is_left;
+    int16_t touch_start_x, touch_start_y;
+    int16_t prev_scaled_x, prev_scaled_y;
+    struct k_work_delayable tap_timeout_work;
+    struct k_work_delayable drag_window_work;
+    struct k_work_delayable drag_jump_work;
+    struct k_work_delayable pad_off_work;  /* deferred BTN_TOUCH=0 on entering INACTIVE */
+    enum pinnacle_scroll_dir scroll_direction;
+    int16_t scroll_ref_x, scroll_ref_y;
+    int32_t scroll_clicks_rem;
+
+    /* Mutable gesture params (copy of DTS defaults, overridable at runtime) */
+    struct pinnacle_gesture_params gesture_params;
 };
 
 enum pinnacle_sensitivity {
@@ -110,8 +162,31 @@ struct pinnacle_config {
     enum pinnacle_sensitivity sensitivity;
     uint8_t x_axis_z_min, y_axis_z_min;
     uint16_t absolute_mode_scale_to_width, absolute_mode_scale_to_height, absolute_mode_clamp_min_x, absolute_mode_clamp_max_x, absolute_mode_clamp_min_y, absolute_mode_clamp_max_y;
+
+    /* Gesture state machine DTS defaults (absolute mode only — copied to
+     * data->gesture_params at init; runtime tuning uses that mutable copy) */
+    uint16_t tap_timeout_ms;
+    uint16_t drag_window_timeout_ms;
+    uint16_t drag_jump_timeout_ms;
+    uint16_t pad_off_timeout_ms;
+    uint8_t scroll_rim_percent;
+    uint8_t drag_jump_rim_percent;
+    uint8_t dead_radius_percent;
+    uint8_t rclick_x_min_percent;
+    uint8_t force_drag_z_threshold;
+    uint8_t double_click_drag_z_threshold;
+    uint8_t wheel_clicks;
+    uint8_t scroll_exclusion_zone_percent;
+    bool tap_snap;
+
     const struct gpio_dt_spec dr;
 };
 
 int pinnacle_set_sleep(const struct device *dev, bool enabled);
 int pinnacle_set_shutdown(const struct device *dev, bool enabled);
+
+/* Runtime gesture parameter get/set (abs mode only).
+ * key is the C field name of pinnacle_gesture_params (e.g. "tap_timeout_ms").
+ * Returns 0 on success, -EINVAL for unknown key. */
+int pinnacle_gesture_param_get(const struct device *dev, const char *key, int32_t *out);
+int pinnacle_gesture_param_set(const struct device *dev, const char *key, int32_t value);

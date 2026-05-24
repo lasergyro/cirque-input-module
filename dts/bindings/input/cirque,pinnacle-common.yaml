@@ -67,3 +67,93 @@ properties:
       Specification says that active reporting of absolute position
       is: 128 ≤ X ≤1920 and 64 ≤ Y ≤ 1472, but on my touchpad, I need other values.
 
+  # ── Gesture state machine (absolute mode only) ────────────────────────────
+
+  tap-timeout-ms:
+    type: int
+    default: 120
+    description: |
+      Duration (ms) a finger must be held before it transitions from TAP_PENDING
+      to MOVING. If lifted before this expires the gesture becomes a click.
+  drag-window-timeout-ms:
+    type: int
+    default: 300
+    description: |
+      Window (ms) after a tap-click for a re-touch to initiate drag-and-drop.
+  drag-jump-timeout-ms:
+    type: int
+    default: 500
+    description: |
+      Window (ms) while dragging after lifting near the rim to re-touch and
+      continue the drag across the pad.
+  pad-off-timeout-ms:
+    type: int
+    default: 200
+    description: |
+      Delay (ms) between entering INACTIVE and emitting BTN_TOUCH=0 (PAD layer
+      off). Cancelled if a new gesture starts within the window.
+
+  scroll-rim-percent:
+    type: int
+    default: 67
+    description: |
+      Scroll-zone rim radius as a percentage of half-pad-width (PAD_CENTER=512).
+      A new touch landing outside this radius (and on the left half) enters SCROLL_ACTIVE.
+      67 → radius = 343 (outer 33 % of pad).
+  drag-jump-rim-percent:
+    type: int
+    default: 67
+    description: |
+      Drag-jump rim radius as a percentage of half-pad-width (PAD_CENTER=512).
+      When dragging, a lift outside this radius enters DRAG_JUMP (finger repositioning).
+      A lift inside this radius ends the drag immediately.
+      67 → radius = 343 (outer 33 % of pad).
+  dead-radius-percent:
+    type: int
+    default: 20
+    description: |
+      Scroll dead-zone radius as a percentage of half-pad-width. Finger entering
+      this zone suppresses scroll events (SCROLL_DEAD).
+  rclick-x-min-percent:
+    type: int
+    default: 29
+    description: |
+      Right-click zone width as a percentage of full pad-width (1024).
+      x <= this threshold triggers right-click (29 → x_min ≈ 297).
+  force-drag-z-threshold:
+    type: int
+    default: 27
+    description: |
+      Minimum z (pressure) for hard-press force-drag: TAP_PENDING→DRAGGING
+      and MOVING→DRAGGING. Both require the same deliberate press to avoid
+      accidental drags.
+  double-click-drag-z-threshold:
+    type: int
+    default: 20
+    description: |
+      Minimum z (pressure) for tap-then-retouch drag: DRAG_WINDOW→DRAGGING.
+      Can be lower than force-drag-z-threshold since the gesture is already
+      intentional (a tap-click was followed by a deliberate retouch).
+      Lighter touches below this value cancel the drag and enter TAP_PENDING.
+  scroll-exclusion-zone-percent:
+    type: int
+    default: 10
+    description: |
+      Width of a y-band centred on the pad middle that blocks scroll initiation
+      (as a percentage of total pad height, default 10 %). A touch landing in
+      this band skips the rim check and enters TAP_PENDING instead of
+      SCROLL_ACTIVE. Prevents accidental scrolls when the finger is placed near
+      the centre of the pad.
+  wheel-clicks:
+    type: int
+    default: 18
+    description: Number of scroll wheel clicks per full finger revolution.
+
+  tap-snap:
+    type: boolean
+    description: |
+      When set, snap prev_scaled_x/y to the current finger position when
+      transitioning TAP_PENDING → MOVING. This discards the delta accumulated
+      during the tap-pending window, so cursor movement starts from zero.
+      Default (unset): accumulated delta is emitted on the first MOVING packet.
+

@@ -1,5 +1,7 @@
 #define DT_DRV_COMPAT cirque_pinnacle
 
+#include <string.h>
+
 #include <zephyr/dt-bindings/input/input-event-codes.h>
 #include <zephyr/init.h>
 #include <zephyr/input/input.h>
@@ -10,6 +12,50 @@
 #include "input_pinnacle.h"
 
 LOG_MODULE_REGISTER(pinnacle, CONFIG_INPUT_LOG_LEVEL);
+
+/* Scaled space is 0–1024; centre is (512, 512).  All gesture thresholds are
+ * derived at runtime from pinnacle_config so they can be tuned via DTS. */
+#define PAD_CENTER 512
+
+/* ── Helpers ───────────────────────────────────────────────────────────────── */
+
+static int32_t dist_sq_from_center(int16_t x, int16_t y) {
+    int32_t dx = x - PAD_CENTER;
+    int32_t dy = y - PAD_CENTER;
+    return dx * dx + dy * dy;
+}
+
+static void pinnacle_scale_abs(const struct pinnacle_config *config,
+                                int16_t raw_x, int16_t raw_y,
+                                int16_t *sx, int16_t *sy) {
+    int16_t x = raw_x, y = raw_y;
+    if (x < config->absolute_mode_clamp_min_x) x = config->absolute_mode_clamp_min_x;
+    else if (x > config->absolute_mode_clamp_max_x) x = config->absolute_mode_clamp_max_x;
+    if (y < config->absolute_mode_clamp_min_y) y = config->absolute_mode_clamp_min_y;
+    else if (y > config->absolute_mode_clamp_max_y) y = config->absolute_mode_clamp_max_y;
+    *sx = (int16_t)((int32_t)(x - config->absolute_mode_clamp_min_x)
+                    * config->absolute_mode_scale_to_width
+                    / (config->absolute_mode_clamp_max_x - config->absolute_mode_clamp_min_x));
+    *sy = (int16_t)((int32_t)(y - config->absolute_mode_clamp_min_y)
+                    * config->absolute_mode_scale_to_height
+                    / (config->absolute_mode_clamp_max_y - config->absolute_mode_clamp_min_y));
+}
+
+/* Integer atan2 returning signed int16; full circle = 65536 units.
+ * Adapted from QMK cirque_pinnacle_gestures.c (GPL-2.0). */
+static int16_t atan2_16(int32_t dy, int32_t dx) {
+    if (dy == 0) {
+        return (dx >= 0) ? 0 : 32767;
+    }
+    int32_t abs_y = (dy > 0) ? dy : -dy;
+    int16_t a;
+    if (dx >= 0) {
+        a = (int16_t)(8192 - (int32_t)8192 * (dx - abs_y) / (dx + abs_y));
+    } else {
+        a = (int16_t)(24576 - (int32_t)8192 * (dx + abs_y) / (abs_y - dx));
+    }
+    return (dy < 0) ? (int16_t)(-a) : a;
+}
 
 static int pinnacle_seq_read(const struct device *dev, const uint8_t addr, uint8_t *buf,
                              const uint8_t len) {
@@ -291,54 +337,337 @@ static void pinnacle_send_rel(const struct device *dev, int8_t dx, int8_t dy) {
     }
 }
 
+/* ── Gesture state machine ─────────────────────────────────────────────────── */
+
 static void pinnacle_send_abs(const struct device *dev) {
     const struct pinnacle_config *config = dev->config;
     struct pinnacle_data *data = dev->data;
-    int16_t x = data->last_x;
-    int16_t y = data->last_y;
-    int8_t z = data->last_z;
+    const struct pinnacle_gesture_params *params = &data->gesture_params;
 
-    LOG_DBG("Clearing status bit");
+    /* Derive gesture thresholds from mutable runtime params. */
+    int32_t scroll_rim_r  = (int32_t)PAD_CENTER * params->scroll_rim_percent / 100;
+    int32_t scroll_rim_sq = scroll_rim_r * scroll_rim_r;
+    int32_t dj_rim_r      = (int32_t)PAD_CENTER * params->drag_jump_rim_percent / 100;
+    int32_t dj_rim_sq     = dj_rim_r * dj_rim_r;
+    int32_t dead_r  = (int32_t)PAD_CENTER * params->dead_radius_percent / 100;
+    int32_t dead_sq = dead_r * dead_r;
+    int16_t rclick_x_min = (int16_t)(1024 * params->rclick_x_min_percent / 100);
+
     pinnacle_clear_status(dev);
     set_int(dev, true);
 
-    uint8_t btn = data->last_btn;
-    if (!config->no_taps && (btn || data->btn_cache)) {
-        for (int i = 0; i < 3; i++) {
-            uint8_t btn_val = btn & BIT(i);
-            LOG_INF("btn: i=%d btn_val=%d btn_cache=%d", i,btn_val,data->btn_cache & BIT(i));
-            if (btn_val != (data->btn_cache & BIT(i))) {
-                input_report_key(dev, INPUT_BTN_0 + i, btn_val ? 1 : 0, false, K_FOREVER);
+    bool is_touching = (data->last_z > 0);
+
+    /* Update z-idle counter; detect new_contact and lift edges. */
+    bool new_contact = false;
+    bool lift = false;
+
+    if (is_touching) {
+        if (data->num_z_idle > 0) {
+            new_contact = true;
+            data->num_z_idle = 0;
+        }
+    } else {
+        data->num_z_idle++;
+        if (data->num_z_idle == NUM_ZIDLE) {
+            lift = true;
+        }
+    }
+
+    /* Scale coordinates (only valid when touching). */
+    int16_t x = 0, y = 0;
+    if (is_touching) {
+        pinnacle_scale_abs(config, data->last_x, data->last_y, &x, &y);
+        LOG_DBG("abs: x=%d y=%d z=%d state=%d", x, y, data->last_z, data->state);
+    } else {
+        LOG_DBG("abs: z=0 num_z_idle=%d state=%d", data->num_z_idle, data->state);
+    }
+
+    switch (data->state) {
+
+    case PINNACLE_STATE_INACTIVE:
+        if (new_contact) {
+            /* Cancel any pending deferred PAD-off from the previous gesture. */
+            k_work_cancel_delayable(&data->pad_off_work);
+            int32_t d2 = dist_sq_from_center(x, y);
+            /* Scroll exclusion band: centred y-band blocks scroll initiation. */
+            int16_t excl_half = (int16_t)((int32_t)1024
+                                          * params->scroll_exclusion_zone_percent / 100 / 2);
+            bool in_excl_band = (y > (PAD_CENTER - excl_half)
+                                 && y < (PAD_CENTER + excl_half));
+            if (d2 > scroll_rim_sq && (x - PAD_CENTER) > 0 && !in_excl_band) {
+                /* Rim zone (left half only, outside exclusion band) → SCROLL_ACTIVE */
+                data->scroll_ref_x = x;
+                data->scroll_ref_y = y;
+                data->scroll_clicks_rem = 0;
+                data->scroll_direction = (y - PAD_CENTER) > 0
+                                         ? PINNACLE_SCROLL_HORIZONTAL
+                                         : PINNACLE_SCROLL_VERTICAL;
+                data->state = PINNACLE_STATE_SCROLL_ACTIVE;
+                LOG_INF("gesture: INACTIVE→SCROLL_ACTIVE dir=%d", data->scroll_direction);
+            } else {
+                /* Inner, right-click, or exclusion-band zone → TAP_PENDING */
+                data->is_left = x > rclick_x_min;
+                data->touch_start_x = x;
+                data->touch_start_y = y;
+                data->prev_scaled_x = x;
+                data->prev_scaled_y = y;
+                data->state = PINNACLE_STATE_TAP_PENDING;
+                k_work_schedule(&data->tap_timeout_work,
+                                K_MSEC(params->tap_timeout_ms));
+                LOG_INF("gesture: INACTIVE→TAP_PENDING is_left=%d", data->is_left);
+            }
+            input_report_key(dev, INPUT_BTN_TOUCH, 1, true, K_FOREVER);
+        }
+        break;
+
+    case PINNACLE_STATE_TAP_PENDING:
+        /* Hard press: skip tap timeout and jump straight to DRAGGING. */
+        if (is_touching && data->last_z >= params->force_drag_z_threshold) {
+            k_work_cancel_delayable(&data->tap_timeout_work);
+            uint16_t btn_tp = data->is_left ? INPUT_BTN_0 : INPUT_BTN_1;
+            input_report_key(dev, btn_tp, 1, true, K_FOREVER);
+            data->prev_scaled_x = x;
+            data->prev_scaled_y = y;
+            data->state = PINNACLE_STATE_DRAGGING;
+            LOG_INF("gesture: TAP_PENDING→DRAGGING (hard press z=%d)", data->last_z);
+        }
+        /* Otherwise movement suppressed; transitions driven by tap_timeout_work. */
+        break;
+
+    case PINNACLE_STATE_MOVING:
+        if (lift) {
+            data->state = PINNACLE_STATE_INACTIVE;
+            k_work_schedule(&data->pad_off_work,
+                            K_MSEC(params->pad_off_timeout_ms));
+            LOG_INF("gesture: MOVING→INACTIVE");
+        } else if (is_touching) {
+            if (data->last_z >= params->force_drag_z_threshold) {
+                /* Hard press while moving → DRAGGING, always left button. */
+                data->is_left = true;
+                data->prev_scaled_x = x;
+                data->prev_scaled_y = y;
+                input_report_key(dev, INPUT_BTN_0, 1, true, K_FOREVER);
+                data->state = PINNACLE_STATE_DRAGGING;
+                LOG_INF("gesture: MOVING→DRAGGING (hard press z=%d)", data->last_z);
+            } else {
+                int16_t dx = x - data->prev_scaled_x;
+                int16_t dy = y - data->prev_scaled_y;
+                data->prev_scaled_x = x;
+                data->prev_scaled_y = y;
+                if (dx != 0 || dy != 0) {
+                    input_report_rel(dev, INPUT_REL_X, dx, false, K_FOREVER);
+                    input_report_rel(dev, INPUT_REL_Y, dy, true, K_FOREVER);
+                }
             }
         }
+        break;
+
+    case PINNACLE_STATE_DRAG_WINDOW:
+        if (new_contact) {
+            k_work_cancel_delayable(&data->drag_window_work);
+            if (data->last_z >= params->double_click_drag_z_threshold) {
+                /* Firm contact — begin drag. */
+                data->prev_scaled_x = x;
+                data->prev_scaled_y = y;
+                data->state = PINNACLE_STATE_DRAGGING;
+                LOG_INF("gesture: DRAG_WINDOW→DRAGGING (z=%d)", data->last_z);
+            } else {
+                /* Light contact — cancel drag, treat as new gesture.
+                 * Release the held button first (with sync). PAD stays ON. */
+                uint16_t btn = data->is_left ? INPUT_BTN_0 : INPUT_BTN_1;
+                input_report_key(dev, btn, 0, true, K_FOREVER);
+                data->is_left = (x > rclick_x_min);
+                data->touch_start_x = x;
+                data->touch_start_y = y;
+                data->prev_scaled_x = x;
+                data->prev_scaled_y = y;
+                k_work_cancel_delayable(&data->pad_off_work);
+                data->state = PINNACLE_STATE_TAP_PENDING;
+                k_work_schedule(&data->tap_timeout_work,
+                                K_MSEC(params->tap_timeout_ms));
+                LOG_INF("gesture: DRAG_WINDOW→TAP_PENDING (z=%d, light touch)", data->last_z);
+            }
+        }
+        break;
+
+    case PINNACLE_STATE_DRAGGING:
+        if (lift) {
+            /* Only enter DRAG_JUMP if the last position was near the rim (user
+             * repositioning across the pad). A centre lift ends the drag. */
+            int32_t d2_lift = dist_sq_from_center(data->prev_scaled_x, data->prev_scaled_y);
+            if (d2_lift > dj_rim_sq) {
+                data->state = PINNACLE_STATE_DRAG_JUMP;
+                k_work_schedule(&data->drag_jump_work,
+                                K_MSEC(params->drag_jump_timeout_ms));
+                LOG_INF("gesture: DRAGGING→DRAG_JUMP (at rim)");
+            } else {
+                uint16_t btn = data->is_left ? INPUT_BTN_0 : INPUT_BTN_1;
+                input_report_key(dev, btn, 0, true, K_FOREVER);
+                data->state = PINNACLE_STATE_INACTIVE;
+                k_work_schedule(&data->pad_off_work,
+                                K_MSEC(params->pad_off_timeout_ms));
+                LOG_INF("gesture: DRAGGING→INACTIVE (not at rim)");
+            }
+        } else if (is_touching) {
+            int16_t dx = x - data->prev_scaled_x;
+            int16_t dy = y - data->prev_scaled_y;
+            data->prev_scaled_x = x;
+            data->prev_scaled_y = y;
+            if (dx != 0 || dy != 0) {
+                input_report_rel(dev, INPUT_REL_X, dx, false, K_FOREVER);
+                input_report_rel(dev, INPUT_REL_Y, dy, true, K_FOREVER);
+            }
+        }
+        break;
+
+    case PINNACLE_STATE_DRAG_JUMP:
+        if (new_contact) {
+            k_work_cancel_delayable(&data->drag_jump_work);
+            data->prev_scaled_x = x;
+            data->prev_scaled_y = y;
+            data->state = PINNACLE_STATE_DRAGGING;
+            LOG_INF("gesture: DRAG_JUMP→DRAGGING");
+        }
+        break;
+
+    case PINNACLE_STATE_SCROLL_ACTIVE:
+        if (lift) {
+            data->scroll_clicks_rem = 0;
+            data->state = PINNACLE_STATE_INACTIVE;
+            k_work_schedule(&data->pad_off_work,
+                            K_MSEC(params->pad_off_timeout_ms));
+            LOG_INF("gesture: SCROLL_ACTIVE→INACTIVE");
+        } else if (is_touching) {
+            int32_t d2 = dist_sq_from_center(x, y);
+            if (d2 < dead_sq) {
+                data->state = PINNACLE_STATE_SCROLL_DEAD;
+                LOG_INF("gesture: SCROLL_ACTIVE→SCROLL_DEAD");
+            } else {
+                /* Angular delta from reference position (both centered at origin). */
+                int32_t rx = data->scroll_ref_x - PAD_CENTER;
+                int32_t ry = data->scroll_ref_y - PAD_CENTER;
+                int32_t cx = x - PAD_CENTER;
+                int32_t cy = y - PAD_CENTER;
+                int32_t dot = rx * cx + ry * cy;
+                int32_t det = rx * cy - ry * cx;
+                int16_t ang = atan2_16(det, dot);
+                data->scroll_clicks_rem += (int32_t)ang * params->wheel_clicks;
+                int32_t whole_clicks = data->scroll_clicks_rem / 65536;
+                data->scroll_clicks_rem -= whole_clicks * 65536;
+                if (whole_clicks != 0) {
+                    uint16_t axis = (data->scroll_direction == PINNACLE_SCROLL_HORIZONTAL)
+                                    ? INPUT_REL_HWHEEL : INPUT_REL_WHEEL;
+                    input_report_rel(dev, axis, (int32_t)whole_clicks, true, K_FOREVER);
+                    LOG_DBG("scroll: dir=%d clicks=%d", data->scroll_direction, (int)whole_clicks);
+                }
+                data->scroll_ref_x = x;
+                data->scroll_ref_y = y;
+            }
+        }
+        break;
+
+    case PINNACLE_STATE_SCROLL_DEAD:
+        if (lift) {
+            data->state = PINNACLE_STATE_INACTIVE;
+            k_work_schedule(&data->pad_off_work,
+                            K_MSEC(params->pad_off_timeout_ms));
+            LOG_INF("gesture: SCROLL_DEAD→INACTIVE");
+        } else if (is_touching) {
+            int32_t d2 = dist_sq_from_center(x, y);
+            if (d2 >= dead_sq) {
+                /* Exited dead zone — reset reference and resume scrolling. */
+                data->scroll_ref_x = x;
+                data->scroll_ref_y = y;
+                data->state = PINNACLE_STATE_SCROLL_ACTIVE;
+                LOG_INF("gesture: SCROLL_DEAD→SCROLL_ACTIVE");
+            }
+        }
+        break;
+    }
+}
+
+/* ── Gesture timer callbacks ──────────────────────────────────────────────── */
+
+static void tap_timeout_cb(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct pinnacle_data *data = CONTAINER_OF(dwork, struct pinnacle_data, tap_timeout_work);
+    const struct device *dev = data->dev;
+    const struct pinnacle_config *config = dev->config;
+
+    if (data->state != PINNACLE_STATE_TAP_PENDING) {
+        return;
     }
 
-    data->btn_cache = btn;
-
-    if (z > 0) {
-        if (x < config->absolute_mode_clamp_min_x) {
-            x = config->absolute_mode_clamp_min_x;
-        } else if (x > config->absolute_mode_clamp_max_x) {
-            x = config->absolute_mode_clamp_max_x;
+    if (data->last_z > 0) {
+        /* Finger still down → MOVING.
+         * If tap-snap is enabled, snap prev_scaled to the current position so
+         * movement starts from zero. Otherwise keep prev_scaled at touch_start
+         * so the first MOVING packet emits the delta accumulated while pending. */
+        if (data->gesture_params.tap_snap) {
+            int16_t sx, sy;
+            pinnacle_scale_abs(config, data->last_x, data->last_y, &sx, &sy);
+            data->prev_scaled_x = sx;
+            data->prev_scaled_y = sy;
         }
-        if (y < config->absolute_mode_clamp_min_y) {
-            y = config->absolute_mode_clamp_min_y;
-        } else if (y > config->absolute_mode_clamp_max_y) {
-            y = config->absolute_mode_clamp_max_y;
-        }
-
-        // scale to be in the configured interval
-        x = ((x - config->absolute_mode_clamp_min_x) * config->absolute_mode_scale_to_width) / (config->absolute_mode_clamp_max_x - config->absolute_mode_clamp_min_x);
-        y = ((y - config->absolute_mode_clamp_min_y) * config->absolute_mode_scale_to_height) / (config->absolute_mode_clamp_max_y - config->absolute_mode_clamp_min_y);
-
-        LOG_INF("abs report: x=%d y=%d", x, y);
-        input_report_abs(dev, INPUT_ABS_X, x, false, K_FOREVER);
-        input_report_abs(dev, INPUT_ABS_Y, y, true, K_FOREVER);
+        data->state = PINNACLE_STATE_MOVING;
+        LOG_INF("gesture: TAP_PENDING→MOVING snap=%d", data->gesture_params.tap_snap);
     } else {
-        LOG_INF("abs: z=0, no events emitted");
+        /* Finger lifted → button down + DRAG_WINDOW. */
+        uint16_t btn = data->is_left ? INPUT_BTN_0 : INPUT_BTN_1;
+        input_report_key(dev, btn, 1, true, K_FOREVER);
+        k_work_schedule(&data->drag_window_work,
+                        K_MSEC(data->gesture_params.drag_window_timeout_ms));
+        data->state = PINNACLE_STATE_DRAG_WINDOW;
+        LOG_INF("gesture: TAP_PENDING→DRAG_WINDOW btn=%d", btn);
+    }
+}
+
+static void pad_off_cb(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct pinnacle_data *data = CONTAINER_OF(dwork, struct pinnacle_data, pad_off_work);
+    const struct device *dev = data->dev;
+
+    if (data->state != PINNACLE_STATE_INACTIVE) {
+        return;
+    }
+    input_report_key(dev, INPUT_BTN_TOUCH, 0, true, K_FOREVER);
+    LOG_INF("gesture: PAD OFF (deferred)");
+}
+
+static void drag_window_cb(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct pinnacle_data *data = CONTAINER_OF(dwork, struct pinnacle_data, drag_window_work);
+    const struct device *dev = data->dev;
+    if (data->state != PINNACLE_STATE_DRAG_WINDOW) {
+        return;
     }
 
-    return;
+    /* Drag window expired: release button, then schedule deferred PAD-off.
+     * btn must use sync=true: BTN_TOUCH is consumed by zip_touch_behaviors and
+     * never reaches input_listener, so btn=0 must carry its own sync to flush
+     * the HID button-release report. */
+    uint16_t btn = data->is_left ? INPUT_BTN_0 : INPUT_BTN_1;
+    input_report_key(dev, btn, 0, true, K_FOREVER);
+    data->state = PINNACLE_STATE_INACTIVE;
+    k_work_schedule(&data->pad_off_work, K_MSEC(data->gesture_params.pad_off_timeout_ms));
+    LOG_INF("gesture: DRAG_WINDOW→INACTIVE (timeout)");
+}
+
+static void drag_jump_cb(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct pinnacle_data *data = CONTAINER_OF(dwork, struct pinnacle_data, drag_jump_work);
+    const struct device *dev = data->dev;
+    if (data->state != PINNACLE_STATE_DRAG_JUMP) {
+        return;
+    }
+
+    /* Same sync reasoning as drag_window_cb. */
+    uint16_t btn = data->is_left ? INPUT_BTN_0 : INPUT_BTN_1;
+    input_report_key(dev, btn, 0, true, K_FOREVER);
+    data->state = PINNACLE_STATE_INACTIVE;
+    k_work_schedule(&data->pad_off_work, K_MSEC(data->gesture_params.pad_off_timeout_ms));
+    LOG_INF("gesture: DRAG_JUMP→INACTIVE (timeout)");
 }
 
 static int pinnacle_read_abs(const struct device *dev) {
@@ -368,7 +697,7 @@ static int pinnacle_read_abs(const struct device *dev) {
     data->last_y = ((xy_high & 0xF0) << 4) | y_low;
     data->last_z = (uint8_t)(packet[5] & 0x1F);
 
-    LOG_INF("abs pkt: btn=%d x=%d y=%d z=%d", data->last_btn, data->last_x, data->last_y, data->last_z);
+    LOG_DBG("abs pkt: btn=%d x=%d y=%d z=%d", data->last_btn, data->last_x, data->last_y, data->last_z);
     return 0;
 }
 
@@ -625,6 +954,54 @@ int pinnacle_set_shutdown(const struct device *dev, bool enabled) {
     return ret;
 }
 
+/* ── Runtime gesture parameter get/set ──────────────────────────────────────── */
+
+#define _PGET(field) \
+    if (strcmp(key, #field) == 0) { *out = (int32_t)p->field; return 0; }
+#define _PSET(field, type) \
+    if (strcmp(key, #field) == 0) { p->field = (type)value; return 0; }
+
+int pinnacle_gesture_param_get(const struct device *dev, const char *key, int32_t *out) {
+    struct pinnacle_data *data = dev->data;
+    const struct pinnacle_gesture_params *p = &data->gesture_params;
+    _PGET(tap_timeout_ms)
+    _PGET(drag_window_timeout_ms)
+    _PGET(drag_jump_timeout_ms)
+    _PGET(pad_off_timeout_ms)
+    _PGET(scroll_rim_percent)
+    _PGET(drag_jump_rim_percent)
+    _PGET(dead_radius_percent)
+    _PGET(rclick_x_min_percent)
+    _PGET(force_drag_z_threshold)
+    _PGET(double_click_drag_z_threshold)
+    _PGET(wheel_clicks)
+    _PGET(scroll_exclusion_zone_percent)
+    _PGET(tap_snap)
+    return -EINVAL;
+}
+
+int pinnacle_gesture_param_set(const struct device *dev, const char *key, int32_t value) {
+    struct pinnacle_data *data = dev->data;
+    struct pinnacle_gesture_params *p = &data->gesture_params;
+    _PSET(tap_timeout_ms, uint16_t)
+    _PSET(drag_window_timeout_ms, uint16_t)
+    _PSET(drag_jump_timeout_ms, uint16_t)
+    _PSET(pad_off_timeout_ms, uint16_t)
+    _PSET(scroll_rim_percent, uint8_t)
+    _PSET(drag_jump_rim_percent, uint8_t)
+    _PSET(dead_radius_percent, uint8_t)
+    _PSET(rclick_x_min_percent, uint8_t)
+    _PSET(force_drag_z_threshold, uint8_t)
+    _PSET(double_click_drag_z_threshold, uint8_t)
+    _PSET(wheel_clicks, uint8_t)
+    _PSET(scroll_exclusion_zone_percent, uint8_t)
+    if (strcmp(key, "tap_snap") == 0) { p->tap_snap = (value != 0); return 0; }
+    return -EINVAL;
+}
+
+#undef _PGET
+#undef _PSET
+
 static int pinnacle_init(const struct device *dev) {
     struct pinnacle_data *data = dev->data;
     const struct pinnacle_config *config = dev->config;
@@ -734,6 +1111,29 @@ static int pinnacle_init(const struct device *dev) {
 
     data->dev = dev;
 
+    /* Pre-set num_z_idle so the first touch is recognised as a new contact. */
+    data->num_z_idle = NUM_ZIDLE;
+    data->state = PINNACLE_STATE_INACTIVE;
+
+    /* Copy DTS gesture defaults into the mutable runtime params. Settings
+     * subsystem (debug_rpc.c) may override these after init completes. */
+    if (config->absolute_mode) {
+        struct pinnacle_gesture_params *p = &data->gesture_params;
+        p->tap_timeout_ms               = config->tap_timeout_ms;
+        p->drag_window_timeout_ms       = config->drag_window_timeout_ms;
+        p->drag_jump_timeout_ms         = config->drag_jump_timeout_ms;
+        p->pad_off_timeout_ms           = config->pad_off_timeout_ms;
+        p->scroll_rim_percent           = config->scroll_rim_percent;
+        p->drag_jump_rim_percent        = config->drag_jump_rim_percent;
+        p->dead_radius_percent          = config->dead_radius_percent;
+        p->rclick_x_min_percent         = config->rclick_x_min_percent;
+        p->force_drag_z_threshold        = config->force_drag_z_threshold;
+        p->double_click_drag_z_threshold = config->double_click_drag_z_threshold;
+        p->wheel_clicks                 = config->wheel_clicks;
+        p->scroll_exclusion_zone_percent = config->scroll_exclusion_zone_percent;
+        p->tap_snap                     = config->tap_snap;
+    }
+
     pinnacle_clear_status(dev);
 
     gpio_pin_configure_dt(&config->dr, GPIO_INPUT);
@@ -745,6 +1145,13 @@ static int pinnacle_init(const struct device *dev) {
     }
 
     k_work_init(&data->work, pinnacle_work_cb);
+
+    if (config->absolute_mode) {
+        k_work_init_delayable(&data->tap_timeout_work, tap_timeout_cb);
+        k_work_init_delayable(&data->drag_window_work, drag_window_cb);
+        k_work_init_delayable(&data->drag_jump_work, drag_jump_cb);
+        k_work_init_delayable(&data->pad_off_work, pad_off_cb);
+    }
 
     pinnacle_write(dev, PINNACLE_FEED_CFG1, feed_cfg1);
 
@@ -798,6 +1205,19 @@ static int pinnacle_pm_action(const struct device *dev, enum pm_device_action ac
         .x_axis_z_min = DT_INST_PROP_OR(n, x_axis_z_min, 5),                                       \
         .y_axis_z_min = DT_INST_PROP_OR(n, y_axis_z_min, 4),                                       \
         .sensitivity = DT_INST_ENUM_IDX_OR(n, sensitivity, PINNACLE_SENSITIVITY_1X),               \
+        .tap_timeout_ms = DT_INST_PROP(n, tap_timeout_ms),                                         \
+        .drag_window_timeout_ms = DT_INST_PROP(n, drag_window_timeout_ms),                         \
+        .drag_jump_timeout_ms = DT_INST_PROP(n, drag_jump_timeout_ms),                             \
+        .pad_off_timeout_ms = DT_INST_PROP(n, pad_off_timeout_ms),                                 \
+        .scroll_rim_percent = DT_INST_PROP(n, scroll_rim_percent),                                 \
+        .drag_jump_rim_percent = DT_INST_PROP(n, drag_jump_rim_percent),                           \
+        .dead_radius_percent = DT_INST_PROP(n, dead_radius_percent),                               \
+        .rclick_x_min_percent = DT_INST_PROP(n, rclick_x_min_percent),                             \
+        .force_drag_z_threshold = DT_INST_PROP(n, force_drag_z_threshold),                         \
+        .double_click_drag_z_threshold = DT_INST_PROP(n, double_click_drag_z_threshold),           \
+        .scroll_exclusion_zone_percent = DT_INST_PROP(n, scroll_exclusion_zone_percent),           \
+        .wheel_clicks = DT_INST_PROP(n, wheel_clicks),                                             \
+        .tap_snap = DT_INST_PROP(n, tap_snap),                                                     \
         .dr = GPIO_DT_SPEC_GET_OR(DT_DRV_INST(n), dr_gpios, {}),                                   \
     };                                                                                             \
     PM_DEVICE_DT_INST_DEFINE(n, pinnacle_pm_action);                                               \
