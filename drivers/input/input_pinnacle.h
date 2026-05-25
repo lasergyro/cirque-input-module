@@ -190,3 +190,5 @@ int pinnacle_set_shutdown(const struct device *dev, bool enabled);
  * Returns 0 on success, -EINVAL for unknown key. */
 int pinnacle_gesture_param_get(const struct device *dev, const char *key, int32_t *out);
 int pinnacle_gesture_param_set(const struct device *dev, const char *key, int32_t value);
+
+void cirque_pinnacle_inject_abs(const struct device *dev, int16_t x, int16_t y, int8_t z);

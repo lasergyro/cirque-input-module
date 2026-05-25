@@ -337,8 +337,6 @@ static void pinnacle_send_rel(const struct device *dev, int8_t dx, int8_t dy) {
     }
 }
 
-/* ── Gesture state machine ─────────────────────────────────────────────────── */
-
 static void pinnacle_send_abs(const struct device *dev) {
     const struct pinnacle_config *config = dev->config;
     struct pinnacle_data *data = dev->data;
@@ -1226,3 +1224,11 @@ static int pinnacle_pm_action(const struct device *dev, enum pm_device_action ac
                           NULL);
 
 DT_INST_FOREACH_STATUS_OKAY(PINNACLE_INST)
+
+void cirque_pinnacle_inject_abs(const struct device *dev, int16_t x, int16_t y, int8_t z) {
+    struct pinnacle_data *data = dev->data;
+    data->last_x = x;
+    data->last_y = y;
+    data->last_z = z;
+    pinnacle_send_abs(dev);
+}
