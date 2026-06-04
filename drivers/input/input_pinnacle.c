@@ -393,7 +393,7 @@ static void pinnacle_send_abs(const struct device *dev) {
                                           * params->scroll_exclusion_zone_percent / 100 / 2);
             bool in_excl_band = (y > (PAD_CENTER - excl_half)
                                  && y < (PAD_CENTER + excl_half));
-            if (d2 > scroll_rim_sq && (x - PAD_CENTER) > 0 && !in_excl_band) {
+            if (params->scroll_enable && d2 > scroll_rim_sq && (x - PAD_CENTER) > 0 && !in_excl_band) {
                 /* Rim zone (left half only, outside exclusion band) → SCROLL_ACTIVE */
                 data->scroll_ref_x = x;
                 data->scroll_ref_y = y;
@@ -403,9 +403,9 @@ static void pinnacle_send_abs(const struct device *dev) {
                                          : PINNACLE_SCROLL_VERTICAL;
                 data->state = PINNACLE_STATE_SCROLL_ACTIVE;
                 LOG_INF("gesture: INACTIVE→SCROLL_ACTIVE dir=%d", data->scroll_direction);
-            } else {
+            } else if (params->tap_enable) {
                 /* Inner, right-click, or exclusion-band zone → TAP_PENDING */
-                data->is_left = x > rclick_x_min;
+                data->is_left = params->rclick_enable ? (x > rclick_x_min) : true;
                 data->touch_start_x = x;
                 data->touch_start_y = y;
                 data->prev_scaled_x = x;
@@ -414,6 +414,14 @@ static void pinnacle_send_abs(const struct device *dev) {
                 k_work_schedule(&data->tap_timeout_work,
                                 K_MSEC(params->tap_timeout_ms));
                 LOG_INF("gesture: INACTIVE→TAP_PENDING is_left=%d", data->is_left);
+            } else {
+                /* Tap disabled → MOVING immediately */
+                data->touch_start_x = x;
+                data->touch_start_y = y;
+                data->prev_scaled_x = x;
+                data->prev_scaled_y = y;
+                data->state = PINNACLE_STATE_MOVING;
+                LOG_INF("gesture: INACTIVE→MOVING (tap disabled)");
             }
             input_report_key(dev, INPUT_BTN_TOUCH, 1, true, K_FOREVER);
         }
@@ -421,7 +429,7 @@ static void pinnacle_send_abs(const struct device *dev) {
 
     case PINNACLE_STATE_TAP_PENDING:
         /* Hard press: skip tap timeout and jump straight to DRAGGING. */
-        if (is_touching && data->last_z >= params->force_drag_z_threshold) {
+        if (params->drag_enable && is_touching && data->last_z >= params->force_drag_z_threshold) {
             k_work_cancel_delayable(&data->tap_timeout_work);
             uint16_t btn_tp = data->is_left ? INPUT_BTN_0 : INPUT_BTN_1;
             input_report_key(dev, btn_tp, 1, true, K_FOREVER);
@@ -440,7 +448,7 @@ static void pinnacle_send_abs(const struct device *dev) {
                             K_MSEC(params->pad_off_timeout_ms));
             LOG_INF("gesture: MOVING→INACTIVE");
         } else if (is_touching) {
-            if (data->last_z >= params->force_drag_z_threshold) {
+            if (params->drag_enable && data->last_z >= params->force_drag_z_threshold) {
                 /* Hard press while moving → DRAGGING, always left button. */
                 data->is_left = true;
                 data->prev_scaled_x = x;
@@ -475,7 +483,7 @@ static void pinnacle_send_abs(const struct device *dev) {
                  * Release the held button first (with sync). PAD stays ON. */
                 uint16_t btn = data->is_left ? INPUT_BTN_0 : INPUT_BTN_1;
                 input_report_key(dev, btn, 0, true, K_FOREVER);
-                data->is_left = (x > rclick_x_min);
+                data->is_left = params->rclick_enable ? (x > rclick_x_min) : true;
                 data->touch_start_x = x;
                 data->touch_start_y = y;
                 data->prev_scaled_x = x;
@@ -611,13 +619,21 @@ static void tap_timeout_cb(struct k_work *work) {
         data->state = PINNACLE_STATE_MOVING;
         LOG_INF("gesture: TAP_PENDING→MOVING snap=%d", data->gesture_params.tap_snap);
     } else {
-        /* Finger lifted → button down + DRAG_WINDOW. */
+        /* Finger lifted → button down. */
         uint16_t btn = data->is_left ? INPUT_BTN_0 : INPUT_BTN_1;
         input_report_key(dev, btn, 1, true, K_FOREVER);
-        k_work_schedule(&data->drag_window_work,
-                        K_MSEC(data->gesture_params.drag_window_timeout_ms));
-        data->state = PINNACLE_STATE_DRAG_WINDOW;
-        LOG_INF("gesture: TAP_PENDING→DRAG_WINDOW btn=%d", btn);
+        if (data->gesture_params.drag_enable) {
+            k_work_schedule(&data->drag_window_work,
+                            K_MSEC(data->gesture_params.drag_window_timeout_ms));
+            data->state = PINNACLE_STATE_DRAG_WINDOW;
+            LOG_INF("gesture: TAP_PENDING→DRAG_WINDOW btn=%d", btn);
+        } else {
+            input_report_key(dev, btn, 0, true, K_FOREVER);
+            data->state = PINNACLE_STATE_INACTIVE;
+            k_work_schedule(&data->pad_off_work,
+                            K_MSEC(data->gesture_params.pad_off_timeout_ms));
+            LOG_INF("gesture: TAP_PENDING→INACTIVE (drag disabled) btn=%d", btn);
+        }
     }
 }
 
@@ -975,6 +991,10 @@ int pinnacle_gesture_param_get(const struct device *dev, const char *key, int32_
     _PGET(wheel_clicks)
     _PGET(scroll_exclusion_zone_percent)
     _PGET(tap_snap)
+    _PGET(tap_enable)
+    _PGET(rclick_enable)
+    _PGET(drag_enable)
+    _PGET(scroll_enable)
     return -EINVAL;
 }
 
@@ -994,6 +1014,10 @@ int pinnacle_gesture_param_set(const struct device *dev, const char *key, int32_
     _PSET(wheel_clicks, uint8_t)
     _PSET(scroll_exclusion_zone_percent, uint8_t)
     if (strcmp(key, "tap_snap") == 0) { p->tap_snap = (value != 0); return 0; }
+    if (strcmp(key, "tap_enable") == 0) { p->tap_enable = (value != 0); return 0; }
+    if (strcmp(key, "rclick_enable") == 0) { p->rclick_enable = (value != 0); return 0; }
+    if (strcmp(key, "drag_enable") == 0) { p->drag_enable = (value != 0); return 0; }
+    if (strcmp(key, "scroll_enable") == 0) { p->scroll_enable = (value != 0); return 0; }
     return -EINVAL;
 }
 
@@ -1130,6 +1154,10 @@ static int pinnacle_init(const struct device *dev) {
         p->wheel_clicks                 = config->wheel_clicks;
         p->scroll_exclusion_zone_percent = config->scroll_exclusion_zone_percent;
         p->tap_snap                     = config->tap_snap;
+        p->tap_enable                   = config->tap_enable;
+        p->rclick_enable                = config->rclick_enable;
+        p->drag_enable                  = config->drag_enable;
+        p->scroll_enable                = config->scroll_enable;
     }
 
     pinnacle_clear_status(dev);
@@ -1216,6 +1244,10 @@ static int pinnacle_pm_action(const struct device *dev, enum pm_device_action ac
         .scroll_exclusion_zone_percent = DT_INST_PROP(n, scroll_exclusion_zone_percent),           \
         .wheel_clicks = DT_INST_PROP(n, wheel_clicks),                                             \
         .tap_snap = DT_INST_PROP(n, tap_snap),                                                     \
+        .tap_enable = DT_INST_PROP(n, tap_enable),                                                 \
+        .rclick_enable = DT_INST_PROP(n, rclick_enable),                                           \
+        .drag_enable = DT_INST_PROP(n, drag_enable),                                               \
+        .scroll_enable = DT_INST_PROP(n, scroll_enable),                                           \
         .dr = GPIO_DT_SPEC_GET_OR(DT_DRV_INST(n), dr_gpios, {}),                                   \
     };                                                                                             \
     PM_DEVICE_DT_INST_DEFINE(n, pinnacle_pm_action);                                               \

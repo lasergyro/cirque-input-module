@@ -157,3 +157,16 @@ properties:
       during the tap-pending window, so cursor movement starts from zero.
       Default (unset): accumulated delta is emitted on the first MOVING packet.
 
+  tap-enable:
+    type: boolean
+    description: Enable tap to click gestures
+  rclick-enable:
+    type: boolean
+    description: Enable right-click tap gestures on the edge of the touchpad
+  drag-enable:
+    type: boolean
+    description: Enable dragging gestures (force drag, double click drag)
+  scroll-enable:
+    type: boolean
+    description: Enable scroll gesture on the rim
+

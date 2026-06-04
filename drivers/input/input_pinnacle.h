@@ -90,7 +90,10 @@ struct pinnacle_gesture_params {
     uint8_t  wheel_clicks;
     uint8_t  scroll_exclusion_zone_percent;
     bool     tap_snap;
-};
+    bool     tap_enable;
+    bool     rclick_enable;
+    bool     drag_enable;
+    bool     scroll_enable;
 
 /* Gesture state machine states */
 enum pinnacle_gesture_state {
@@ -178,7 +181,10 @@ struct pinnacle_config {
     uint8_t wheel_clicks;
     uint8_t scroll_exclusion_zone_percent;
     bool tap_snap;
-
+    bool tap_enable;
+    bool rclick_enable;
+    bool drag_enable;
+    bool scroll_enable;
     const struct gpio_dt_spec dr;
 };
 
