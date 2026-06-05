@@ -708,7 +708,6 @@ static void pad_off_cb(struct k_work *work) {
 static void drag_window_cb(struct k_work *work) {
     struct k_work_delayable *dwork = k_work_delayable_from_work(work);
     struct pinnacle_data *data = CONTAINER_OF(dwork, struct pinnacle_data, drag_window_work);
-    const struct device *dev = data->dev;
     if (data->state != PINNACLE_STATE_DRAG_WINDOW) {
         return;
     }
