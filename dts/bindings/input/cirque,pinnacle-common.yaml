@@ -78,8 +78,13 @@ properties:
   drag-window-timeout-ms:
     type: int
     default: 300
+    description: Max ms between tap and second-touch for a drag.
+  drag-pending-timeout-ms:
+    type: int
+    default: 120
     description: |
-      Window (ms) after a tap-click for a re-touch to initiate drag-and-drop.
+      ms to suppress movement when second-touch starts a drag. 
+      Prevents double-click jitter.
   drag-jump-timeout-ms:
     type: int
     default: 500

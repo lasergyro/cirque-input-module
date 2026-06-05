@@ -79,6 +79,7 @@
 struct pinnacle_gesture_params {
     uint16_t tap_timeout_ms;
     uint16_t drag_window_timeout_ms;
+    uint16_t drag_pending_timeout_ms;
     uint16_t drag_jump_timeout_ms;
     uint16_t pad_off_timeout_ms;
     uint8_t  scroll_rim_percent;
@@ -94,6 +95,7 @@ struct pinnacle_gesture_params {
     bool     rclick_enable;
     bool     drag_enable;
     bool     scroll_enable;
+};
 
 /* Gesture state machine states */
 enum pinnacle_gesture_state {
@@ -101,6 +103,7 @@ enum pinnacle_gesture_state {
     PINNACLE_STATE_TAP_PENDING,
     PINNACLE_STATE_MOVING,
     PINNACLE_STATE_DRAG_WINDOW,
+    PINNACLE_STATE_DRAGGING_PENDING,
     PINNACLE_STATE_DRAGGING,
     PINNACLE_STATE_DRAG_JUMP,
     PINNACLE_STATE_SCROLL_ACTIVE,
@@ -130,8 +133,10 @@ struct pinnacle_data {
     int16_t prev_scaled_x, prev_scaled_y;
     struct k_work_delayable tap_timeout_work;
     struct k_work_delayable drag_window_work;
+    struct k_work_delayable drag_pending_timeout_work;
     struct k_work_delayable drag_jump_work;
     struct k_work_delayable pad_off_work;  /* deferred BTN_TOUCH=0 on entering INACTIVE */
+    struct k_work_delayable tap_click_work; /* delay tap BTN=0 to survive BLE batching */
     enum pinnacle_scroll_dir scroll_direction;
     int16_t scroll_ref_x, scroll_ref_y;
     int32_t scroll_clicks_rem;
@@ -170,6 +175,7 @@ struct pinnacle_config {
      * data->gesture_params at init; runtime tuning uses that mutable copy) */
     uint16_t tap_timeout_ms;
     uint16_t drag_window_timeout_ms;
+    uint16_t drag_pending_timeout_ms;
     uint16_t drag_jump_timeout_ms;
     uint16_t pad_off_timeout_ms;
     uint8_t scroll_rim_percent;

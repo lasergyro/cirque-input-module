@@ -473,28 +473,50 @@ static void pinnacle_send_abs(const struct device *dev) {
         if (new_contact) {
             k_work_cancel_delayable(&data->drag_window_work);
             if (data->last_z >= params->double_click_drag_z_threshold) {
-                /* Firm contact — begin drag. */
+                /* Firm contact — begin drag. Wait for drag_pending_timeout to emit movement. */
+                data->touch_start_x = x;
+                data->touch_start_y = y;
                 data->prev_scaled_x = x;
                 data->prev_scaled_y = y;
-                data->state = PINNACLE_STATE_DRAGGING;
-                LOG_INF("gesture: DRAG_WINDOW→DRAGGING (z=%d)", data->last_z);
-            } else {
-                /* Light contact — cancel drag, treat as new gesture.
-                 * Release the held button first (with sync). PAD stays ON. */
+                data->state = PINNACLE_STATE_DRAGGING_PENDING;
+                k_work_schedule(&data->drag_pending_timeout_work,
+                                K_MSEC(params->drag_pending_timeout_ms));
+                
+                /* Release the first tap's click before starting the second gesture */
                 uint16_t btn = data->is_left ? INPUT_BTN_0 : INPUT_BTN_1;
                 input_report_key(dev, btn, 0, true, K_FOREVER);
+                
+                LOG_INF("gesture: DRAG_WINDOW→DRAGGING_PENDING (z=%d)", data->last_z);
+            } else {
+                /* Light contact — cancel drag, treat as new gesture.
+                 * Button already released. PAD stays ON. */
                 data->is_left = params->rclick_enable ? (x > rclick_x_min) : true;
                 data->touch_start_x = x;
                 data->touch_start_y = y;
                 data->prev_scaled_x = x;
                 data->prev_scaled_y = y;
                 k_work_cancel_delayable(&data->pad_off_work);
-                data->state = PINNACLE_STATE_TAP_PENDING;
                 k_work_schedule(&data->tap_timeout_work,
                                 K_MSEC(params->tap_timeout_ms));
-                LOG_INF("gesture: DRAG_WINDOW→TAP_PENDING (z=%d, light touch)", data->last_z);
+                data->state = PINNACLE_STATE_TAP_PENDING;
+                LOG_INF("gesture: DRAG_WINDOW→TAP_PENDING (light touch)");
             }
         }
+        break;
+
+    case PINNACLE_STATE_DRAGGING_PENDING:
+        if (lift) {
+            /* Finger lifted before drag_pending_timeout_ms (Double Tap). */
+            k_work_cancel_delayable(&data->drag_pending_timeout_work);
+            uint16_t btn = data->is_left ? INPUT_BTN_0 : INPUT_BTN_1;
+            input_report_key(dev, btn, 1, true, K_FOREVER);
+            k_work_schedule(&data->tap_click_work, K_MSEC(60));
+            data->state = PINNACLE_STATE_INACTIVE;
+            k_work_schedule(&data->pad_off_work,
+                            K_MSEC(params->pad_off_timeout_ms));
+            LOG_INF("gesture: DRAGGING_PENDING→INACTIVE (double tap)");
+        }
+        /* Otherwise movement suppressed; transitions driven by drag_pending_timeout_work. */
         break;
 
     case PINNACLE_STATE_DRAGGING:
@@ -509,7 +531,7 @@ static void pinnacle_send_abs(const struct device *dev) {
                 LOG_INF("gesture: DRAGGING→DRAG_JUMP (at rim)");
             } else {
                 uint16_t btn = data->is_left ? INPUT_BTN_0 : INPUT_BTN_1;
-                input_report_key(dev, btn, 0, true, K_FOREVER);
+                LOG_INF("gesture: emit btn=0 from %s", __func__); input_report_key(dev, btn, 0, true, K_FOREVER);
                 data->state = PINNACLE_STATE_INACTIVE;
                 k_work_schedule(&data->pad_off_work,
                                 K_MSEC(params->pad_off_timeout_ms));
@@ -595,6 +617,14 @@ static void pinnacle_send_abs(const struct device *dev) {
 
 /* ── Gesture timer callbacks ──────────────────────────────────────────────── */
 
+static void tap_click_cb(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct pinnacle_data *data = CONTAINER_OF(dwork, struct pinnacle_data, tap_click_work);
+    const struct device *dev = data->dev;
+    uint16_t btn = data->is_left ? INPUT_BTN_0 : INPUT_BTN_1;
+    LOG_INF("gesture: emit btn=0 from %s", __func__); input_report_key(dev, btn, 0, true, K_FOREVER);
+}
+
 static void tap_timeout_cb(struct k_work *work) {
     struct k_work_delayable *dwork = k_work_delayable_from_work(work);
     struct pinnacle_data *data = CONTAINER_OF(dwork, struct pinnacle_data, tap_timeout_work);
@@ -619,21 +649,47 @@ static void tap_timeout_cb(struct k_work *work) {
         data->state = PINNACLE_STATE_MOVING;
         LOG_INF("gesture: TAP_PENDING→MOVING snap=%d", data->gesture_params.tap_snap);
     } else {
-        /* Finger lifted → button down. */
+        /* Finger lifted → button down, then schedule up to survive BLE batching. */
         uint16_t btn = data->is_left ? INPUT_BTN_0 : INPUT_BTN_1;
         input_report_key(dev, btn, 1, true, K_FOREVER);
+        k_work_schedule(&data->tap_click_work, K_MSEC(60));
         if (data->gesture_params.drag_enable) {
             k_work_schedule(&data->drag_window_work,
                             K_MSEC(data->gesture_params.drag_window_timeout_ms));
             data->state = PINNACLE_STATE_DRAG_WINDOW;
             LOG_INF("gesture: TAP_PENDING→DRAG_WINDOW btn=%d", btn);
         } else {
-            input_report_key(dev, btn, 0, true, K_FOREVER);
             data->state = PINNACLE_STATE_INACTIVE;
-            k_work_schedule(&data->pad_off_work,
-                            K_MSEC(data->gesture_params.pad_off_timeout_ms));
-            LOG_INF("gesture: TAP_PENDING→INACTIVE (drag disabled) btn=%d", btn);
+            k_work_schedule(&data->pad_off_work, K_MSEC(data->gesture_params.pad_off_timeout_ms));
+            LOG_INF("gesture: TAP_PENDING→INACTIVE btn=%d", btn);
         }
+    }
+}
+
+static void drag_pending_timeout_cb(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct pinnacle_data *data = CONTAINER_OF(dwork, struct pinnacle_data, drag_pending_timeout_work);
+    const struct device *dev = data->dev;
+    const struct pinnacle_config *config = dev->config;
+
+    if (data->state != PINNACLE_STATE_DRAGGING_PENDING) {
+        return;
+    }
+
+    if (data->last_z > 0) {
+        /* Finger held down past timeout → begin actual DRAGGING.
+         * Match tap_timeout_cb logic: if tap-snap is enabled, snap prev_scaled to the
+         * current position so movement starts from zero. Otherwise emit accumulated delta. */
+        if (data->gesture_params.tap_snap) {
+            int16_t sx, sy;
+            pinnacle_scale_abs(config, data->last_x, data->last_y, &sx, &sy);
+            data->prev_scaled_x = sx;
+            data->prev_scaled_y = sy;
+        }
+        data->state = PINNACLE_STATE_DRAGGING;
+        uint16_t btn = data->is_left ? INPUT_BTN_0 : INPUT_BTN_1;
+        input_report_key(dev, btn, 1, true, K_FOREVER);
+        LOG_INF("gesture: DRAGGING_PENDING→DRAGGING snap=%d (emit btn=1)", data->gesture_params.tap_snap);
     }
 }
 
@@ -657,12 +713,7 @@ static void drag_window_cb(struct k_work *work) {
         return;
     }
 
-    /* Drag window expired: release button, then schedule deferred PAD-off.
-     * btn must use sync=true: BTN_TOUCH is consumed by zip_touch_behaviors and
-     * never reaches input_listener, so btn=0 must carry its own sync to flush
-     * the HID button-release report. */
-    uint16_t btn = data->is_left ? INPUT_BTN_0 : INPUT_BTN_1;
-    input_report_key(dev, btn, 0, true, K_FOREVER);
+    /* Drag window expired: button already released, just schedule deferred PAD-off. */
     data->state = PINNACLE_STATE_INACTIVE;
     k_work_schedule(&data->pad_off_work, K_MSEC(data->gesture_params.pad_off_timeout_ms));
     LOG_INF("gesture: DRAG_WINDOW→INACTIVE (timeout)");
@@ -678,7 +729,7 @@ static void drag_jump_cb(struct k_work *work) {
 
     /* Same sync reasoning as drag_window_cb. */
     uint16_t btn = data->is_left ? INPUT_BTN_0 : INPUT_BTN_1;
-    input_report_key(dev, btn, 0, true, K_FOREVER);
+    LOG_INF("gesture: emit btn=0 from %s", __func__); input_report_key(dev, btn, 0, true, K_FOREVER);
     data->state = PINNACLE_STATE_INACTIVE;
     k_work_schedule(&data->pad_off_work, K_MSEC(data->gesture_params.pad_off_timeout_ms));
     LOG_INF("gesture: DRAG_JUMP→INACTIVE (timeout)");
@@ -980,6 +1031,7 @@ int pinnacle_gesture_param_get(const struct device *dev, const char *key, int32_
     const struct pinnacle_gesture_params *p = &data->gesture_params;
     _PGET(tap_timeout_ms)
     _PGET(drag_window_timeout_ms)
+    _PGET(drag_pending_timeout_ms)
     _PGET(drag_jump_timeout_ms)
     _PGET(pad_off_timeout_ms)
     _PGET(scroll_rim_percent)
@@ -1003,6 +1055,7 @@ int pinnacle_gesture_param_set(const struct device *dev, const char *key, int32_
     struct pinnacle_gesture_params *p = &data->gesture_params;
     _PSET(tap_timeout_ms, uint16_t)
     _PSET(drag_window_timeout_ms, uint16_t)
+    _PSET(drag_pending_timeout_ms, uint16_t)
     _PSET(drag_jump_timeout_ms, uint16_t)
     _PSET(pad_off_timeout_ms, uint16_t)
     _PSET(scroll_rim_percent, uint8_t)
@@ -1143,6 +1196,7 @@ static int pinnacle_init(const struct device *dev) {
         struct pinnacle_gesture_params *p = &data->gesture_params;
         p->tap_timeout_ms               = config->tap_timeout_ms;
         p->drag_window_timeout_ms       = config->drag_window_timeout_ms;
+        p->drag_pending_timeout_ms      = config->drag_pending_timeout_ms;
         p->drag_jump_timeout_ms         = config->drag_jump_timeout_ms;
         p->pad_off_timeout_ms           = config->pad_off_timeout_ms;
         p->scroll_rim_percent           = config->scroll_rim_percent;
@@ -1175,8 +1229,10 @@ static int pinnacle_init(const struct device *dev) {
     if (config->absolute_mode) {
         k_work_init_delayable(&data->tap_timeout_work, tap_timeout_cb);
         k_work_init_delayable(&data->drag_window_work, drag_window_cb);
+        k_work_init_delayable(&data->drag_pending_timeout_work, drag_pending_timeout_cb);
         k_work_init_delayable(&data->drag_jump_work, drag_jump_cb);
         k_work_init_delayable(&data->pad_off_work, pad_off_cb);
+        k_work_init_delayable(&data->tap_click_work, tap_click_cb);
     }
 
     pinnacle_write(dev, PINNACLE_FEED_CFG1, feed_cfg1);
@@ -1233,6 +1289,7 @@ static int pinnacle_pm_action(const struct device *dev, enum pm_device_action ac
         .sensitivity = DT_INST_ENUM_IDX_OR(n, sensitivity, PINNACLE_SENSITIVITY_1X),               \
         .tap_timeout_ms = DT_INST_PROP(n, tap_timeout_ms),                                         \
         .drag_window_timeout_ms = DT_INST_PROP(n, drag_window_timeout_ms),                         \
+        .drag_pending_timeout_ms = DT_INST_PROP(n, drag_pending_timeout_ms),                       \
         .drag_jump_timeout_ms = DT_INST_PROP(n, drag_jump_timeout_ms),                             \
         .pad_off_timeout_ms = DT_INST_PROP(n, pad_off_timeout_ms),                                 \
         .scroll_rim_percent = DT_INST_PROP(n, scroll_rim_percent),                                 \
